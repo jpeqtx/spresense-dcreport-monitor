@@ -1,6 +1,7 @@
 /*
  * DcReportMonitorAll
  * QZSS L1S DC Report / DCX all-message monitor for Spresense.
+ * Version 1.1 (2026-11-10).
  *
  * Based on DcReportMonitor (QZQSM library sample), extended to
  * receive ALL messages (filtering is a downstream decision):
@@ -28,6 +29,11 @@
  * (Serial Monitor, newline ending; upper case is accepted)
  *   help                     this command list
  *   show                     list the mode and all item values
+ *   status                   print the satellite / position
+ *                            block once, on demand
+ *   satellites period        show the periodic block interval
+ *   satellites period 300    set the interval (seconds)
+ *   satellites period off    stop the periodic block
  *   mode <name>              apply a mode (table below)
  *   set <item> on | off      switch one item
  *   set report.format full | first | off
@@ -60,7 +66,7 @@
  *   dcx.format            MT44: summary/full/off     S S S S - F S
  *   dcx.classes           DCX classes (above)        a a a L a a a
  *   dcx.empty             print empty DCX messages   - - - - - o -
- *   dcx.emptycount        DCX empty count (60 s)     o o o - - o -
+ *   dcx.emptycount        DCX empty count (periodic) o o o - - o -
  *   dcx.library           DCX A9-A11 guidance        - - - - - o -
  *   dcx.area              DCX A12-A16, Ex3-Ex7 area  - - - - - o -
  *   dcx.target            DCX Ex1, Ex8/Ex9 targets   - o - o - o -
@@ -72,7 +78,7 @@
  *   satellites.elevation  elevation in the list      o - o - - o -
  *   satellites.azimuth    azimuth in the list        o - o - - o -
  *   satellites.signal     C/N in the list            o - o - - o -
- *   position.time         time (JST, 60 s block)     - - o - - o -
+ *   position.time         time (JST, periodic block) - - o - - o -
  *   position.fix          fix mode and type          - - o - - o -
  *   position.used         satellites used            - - o - - o -
  *   position.latitude     latitude                   - - o - - o -
@@ -84,8 +90,11 @@
  *   position.data         position data exists       - - o - - o -
  * (F = full, f = first line, S = summary, a = all categories,
  *  1 = category 1 only, L = lalert + jalert only. The satellite
- *  and position blocks print
- *  every 60 seconds when at least one of their items is on.
+ *  and position blocks print at the mode's period
+ *  (recommended and disaster 600 s, gnss and full 60 s) when
+ *  at least one of their items is on; the period is changed
+ *  with "satellites period", and "status" prints the block
+ *  once on demand.
  *  dcx.library to dcx.meta add detail groups to the summary;
  *  with dcx.format full, printAll includes every field except
  *  SD, which only dcx.meta prints. Changing any item or the
@@ -183,6 +192,16 @@ static bool s_item[IT_COUNT] = {
 static int s_reportFormat = 2;
 static int s_dcxFormat = 1;
 
+/* Periodic satellite / position block interval, in seconds.
+ * 0 = periodic block off (on demand only, "status" command).
+ * Set by modes; changed with "satellites period". */
+static int s_periodSec = 600;
+static int s_tickCounter = 0;
+
+/* Set by the "status" command; consumed in loop() once fresh
+ * NavData is available */
+static bool s_statusRequested = false;
+
 /* MT43 category filter: bit (1 << Dc) set = print that category.
  * Dc is read from the raw message bits 18-21 (IS-QZSS-DCR-017):
  * PAB 8 + MT 6 + Rc 3, then Dc 4 -> (sf[2] >> 3) & 0x0F. */
@@ -213,23 +232,24 @@ struct ModeDef {
   uint16_t cat;
   uint8_t rc;
   uint8_t dcxClass;
+  int period;
 };
 static const ModeDef MODES[] = {
-  /* name          alias   header raw | dcx: empty emptycount library area target settings meta | sat: count systems list elevation azimuth signal | pos: time fix used latitude longitude altitude velocity direction dop | rf df cat */
+  /* name          alias   header raw | dcx: empty emptycount library area target settings meta | sat: count systems list elevation azimuth signal | pos: time fix used latitude longitude altitude velocity direction dop | rf df cat rc dcx period */
   { "recommended", "rec",
-    { 1, 0,   0, 1, 0, 0, 0, 0, 0,   1, 1, 1, 1, 1, 1,   0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 2, 1, CAT_ALL, RC_ALL, DCX_CLASS_ALL },
+    { 1, 0,   0, 1, 0, 0, 0, 0, 0,   1, 1, 1, 1, 1, 1,   0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 2, 1, CAT_ALL, RC_ALL, DCX_CLASS_ALL, 600 },
   { "disaster", "dis",
-    { 1, 0,   0, 1, 0, 0, 1, 0, 0,   1, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 2, 1, CAT_ALL, RC_ALL, DCX_CLASS_ALL },
+    { 1, 0,   0, 1, 0, 0, 1, 0, 0,   1, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 2, 1, CAT_ALL, RC_ALL, DCX_CLASS_ALL, 600 },
   { "gnss", "gnss",
-    { 1, 1,   0, 1, 0, 0, 0, 0, 0,   1, 1, 1, 1, 1, 1,   1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, 2, 1, CAT_ALL, RC_ALL, DCX_CLASS_ALL },
+    { 1, 1,   0, 1, 0, 0, 0, 0, 0,   1, 1, 1, 1, 1, 1,   1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, 2, 1, CAT_ALL, RC_ALL, DCX_CLASS_ALL, 60 },
   { "jalert", "jal",
-    { 1, 0,   0, 0, 0, 0, 1, 0, 0,   0, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 0, 1, CAT_ALL, RC_ALL, (uint8_t)((1u << DCX_MSG_L_ALERT) | (1u << DCX_MSG_J_ALERT)) },
+    { 1, 0,   0, 0, 0, 0, 1, 0, 0,   0, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 0, 1, CAT_ALL, RC_ALL, (uint8_t)((1u << DCX_MSG_L_ALERT) | (1u << DCX_MSG_J_ALERT)), 60 },
   { "eew", "eew",
-    { 1, 0,   0, 0, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 2, 0, (uint16_t)(1u << 1), RC_ALL, DCX_CLASS_ALL },
+    { 1, 0,   0, 0, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 2, 0, (uint16_t)(1u << 1), RC_ALL, DCX_CLASS_ALL, 60 },
   { "full", "full",
-    { 1, 1,   1, 1, 1, 1, 1, 1, 1,   1, 1, 1, 1, 1, 1,   1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, 2, 2, CAT_ALL, RC_ALL, DCX_CLASS_ALL },
+    { 1, 1,   1, 1, 1, 1, 1, 1, 1,   1, 1, 1, 1, 1, 1,   1, 1, 1, 1, 1, 1, 1, 1, 1, 1 }, 2, 2, CAT_ALL, RC_ALL, DCX_CLASS_ALL, 60 },
   { "min", "min",
-    { 1, 0,   0, 0, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 1, 1, CAT_ALL, RC_ALL, DCX_CLASS_ALL },
+    { 1, 0,   0, 0, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0, 0,   0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }, 1, 1, CAT_ALL, RC_ALL, DCX_CLASS_ALL, 60 },
 };
 static const int MODE_COUNT = sizeof(MODES) / sizeof(MODES[0]);
 
@@ -240,6 +260,17 @@ static const char *reportFormatName(int f)
 static const char *dcxFormatName(int f)
 {
   return f == 2 ? "full" : (f == 1 ? "summary" : "off");
+}
+
+static void printPeriodValue()
+{
+  Serial.print(">> satellites.period = ");
+  if (s_periodSec == 0) {
+    Serial.println("off");
+  } else {
+    Serial.print(s_periodSec);
+    Serial.println(" s");
+  }
 }
 
 static void printCatMask()
@@ -299,6 +330,7 @@ static void showStatus()
   Serial.println();
   printItemGroup("common", IT_HEADER, IT_RAW);
   printItemGroup("satellites", IT_SAT_COUNT, IT_SAT_SIGNAL);
+  printPeriodValue();
   printItemGroup("position", IT_POS_TIME, IT_POS_DATA);
 }
 
@@ -306,6 +338,8 @@ static void printHelp()
 {
   Serial.println(">> Commands:");
   Serial.println(">>   show                list the mode and all item values");
+  Serial.println(">>   status              print the satellite/position block once");
+  Serial.println(">>   satellites period [sec|off]  periodic block interval");
   Serial.println(">>   mode <name>         recommended|disaster|gnss|jalert|eew|full|min");
   Serial.println(">>   set <item> on|off   switch one item (names: see header)");
   Serial.println(">>   set report.format full|first|off");
@@ -329,6 +363,8 @@ static bool applyMode(const char *name)
       s_catMask = MODES[i].cat;
       s_rcMask = MODES[i].rc;
       s_dcxClassMask = MODES[i].dcxClass;
+      s_periodSec = MODES[i].period;
+      s_tickCounter = 0;
       strncpy(s_mode, MODES[i].name, sizeof(s_mode) - 1);
       s_mode[sizeof(s_mode) - 1] = '\0';
       Serial.print(">> Mode: ");
@@ -456,6 +492,10 @@ static void printItemValue(const char *name)
     Serial.println(dcxFormatName(s_dcxFormat));
     return;
   }
+  if (strcmp(name, "satellites.period") == 0) {
+    printPeriodValue();
+    return;
+  }
   if (strcmp(name, "report.categories") == 0) {
     Serial.print(">> report.categories = ");
     printCatMask();
@@ -511,6 +551,39 @@ static void execCommand(char *line)
   }
   if (strcmp(tok[0], "show") == 0) {
     showStatus();
+    return;
+  }
+  if (strcmp(tok[0], "status") == 0) {
+    /* Printed in loop() with the next fresh NavData */
+    s_statusRequested = true;
+    return;
+  }
+  if (strcmp(tok[0], "satellites") == 0) {
+    if (ntok >= 2 && strcmp(tok[1], "period") == 0) {
+      if (ntok == 2) {
+        printPeriodValue();
+        return;
+      }
+      const char *a = tok[2];
+      if (strcmp(a, "off") == 0) {
+        s_periodSec = 0;
+      } else if (a[0] >= '0' && a[0] <= '9') {
+        int v = atoi(a);
+        if (v != 0 && (v < 10 || v > 3600)) {
+          Serial.println(">> satellites period: off | 0 | 10-3600 (seconds)");
+          return;
+        }
+        s_periodSec = v;
+      } else {
+        Serial.println(">> satellites period: off | 0 | 10-3600 (seconds)");
+        return;
+      }
+      s_tickCounter = 0;
+      markCustom();
+      printPeriodValue();
+      return;
+    }
+    Serial.println(">> Use: satellites period [seconds | off]");
     return;
   }
   if (strcmp(tok[0], "mode") == 0) {
@@ -1170,12 +1243,23 @@ void loop()
     SpNavData NavData;
     Gnss.getNavData(&NavData);
 
-    // Periodic blocks every 60 seconds, each item gated
-    static int tickCounter = 0;
-    if (++tickCounter >= 60) {
-      tickCounter = 0;
+    // Periodic blocks at the satellites period (0 = off),
+    // each item gated
+    if (s_periodSec > 0 && ++s_tickCounter >= s_periodSec) {
+      s_tickCounter = 0;
       if (anySatItem()) printSatelliteStatus(&NavData);
       if (anyPosItem()) printPosition(&NavData);
+    }
+
+    // On-demand block ("status" command), same gating
+    if (s_statusRequested) {
+      s_statusRequested = false;
+      bool printed = false;
+      if (anySatItem()) { printSatelliteStatus(&NavData); printed = true; }
+      if (anyPosItem()) { printPosition(&NavData); printed = true; }
+      if (!printed) {
+        Serial.println(">> status: no satellite/position items are on (see 'show')");
+      }
     }
 
     // Check if UTC time is acquired

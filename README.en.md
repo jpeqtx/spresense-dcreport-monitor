@@ -13,7 +13,7 @@ Japanese version: [README.md](README.md)
 - Receive everything, by design. Nothing is thinned out at reception; filtering is a display-layer (and future downstream) decision.
 - Repeated transmissions of the same report are suppressed automatically (MT43: against a history of the last 20 decoded reports; MT44: by content bytes).
 - Empty DCX messages (the steady-state message when there is no alert) are counted but not printed by default.
-- Satellite status (visible satellites, per-system counts, systems used for positioning, per-satellite elevation / azimuth / C/N) and position information (fix status, latitude/longitude, altitude, velocity, direction, DOP) can be printed every 60 seconds.
+- Satellite status (visible satellites, per-system counts, systems used for positioning, per-satellite elevation / azimuth / C/N) and position information (fix status, latitude/longitude, altitude, velocity, direction, DOP) can be printed at an interval set by the mode (600 seconds in recommended). The `status` command prints the block once, on demand.
 - 27 display items (25 on/off items plus 2 format items) and 3 selection filters (categories, report classification, DCX class), all controlled by commands from the serial monitor.
 - Starts in the recommended mode.
 
@@ -83,6 +83,17 @@ help
 
 Prints the command list.
 
+### Satellite / position block interval and on-demand print
+
+```
+status                 print the satellite/position block once
+satellites period      show the current interval
+satellites period 300  set the interval to 300 seconds
+satellites period off  stop the periodic block (print only via status)
+```
+
+The interval is set per mode (600 seconds for recommended and disaster, 60 seconds for gnss and full). Applying a mode restores its interval. Changing the interval by hand switches the mode display to custom.
+
 ### Modes (recommended presets)
 
 ```
@@ -140,7 +151,7 @@ Category and classification selection use the `categories` and `priority` comman
 
 Class selection uses the `dcxclass` command below. The detail items from dcx.library onward are appended after the summary when dcx.format is summary. With full, the library's full print takes precedence.
 
-#### Satellites (60-second block)
+#### Satellites (periodic block)
 
 | Item | Meaning |
 |---|---|
@@ -151,9 +162,9 @@ Class selection uses the `dcxclass` command below. The detail items from dcx.lib
 | satellites.azimuth | Azimuth column |
 | satellites.signal | C/N column (dBHz) |
 
-The satellite block prints every 60 seconds when at least one satellites item is on. The empty-message count (dcx.emptycount) appears at the end of this block.
+The satellite block prints at the configured interval when at least one satellites item is on. The empty-message count (dcx.emptycount) appears at the end of this block.
 
-#### Position (60-second block)
+#### Position (periodic block)
 
 | Item | Meaning |
 |---|---|
@@ -168,7 +179,7 @@ The satellite block prints every 60 seconds when at least one satellites item is
 | position.dop | DOP values (PDOP, HDOP, VDOP, TDOP) |
 | position.data | Whether position data exists |
 
-The position block prints every 60 seconds when at least one position item is on. Before a fix, it prints the time and data status followed by "No fix".
+The position block prints at the same interval as the satellite block when at least one position item is on. Before a fix, it prints the time and data status followed by "No fix".
 
 ### Category selection (MT43)
 
